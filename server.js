@@ -13,9 +13,24 @@ const PORT = process.env.PORT || 5000;
 
 app.set("trust proxy", 1);
 
-const allowedOrigins = (process.env.FRONTEND_URL || "").split(",").map((url) => url.trim()).filter(Boolean);
+const allowedOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((url) => url.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
 app.use(cors({
-  origin: allowedOrigins.length ? allowedOrigins : true,
+  origin(origin, callback) {
+    // Allow non-browser/server requests and configured origins.
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+
+    // Vercel preview/production deployments use *.vercel.app. This keeps
+    // the API usable when a new Vercel deployment URL is generated.
+    if (/^https:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error("Not allowed by CORS"));
+  },
   methods: ["GET", "POST", "PATCH", "OPTIONS"],
 }));
 app.use(express.json({ limit: "1mb" }));
