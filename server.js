@@ -2,7 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
+const twilio = require("twilio");
 require("dotenv").config();
 
 const Job = require("./models/Job");
@@ -19,7 +19,9 @@ app.use(express.json({ limit: "1mb" }));
 
 const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 100, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many requests. Please try again later." } });
 const otpLimiter = rateLimit({ windowMs: 10 * 60 * 1000, limit: 5, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many OTP requests. Please try again later." } });
-const otpStore = new Map();
+
+const twilioReady = Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_VERIFY_SERVICE_SID);
+const twilioClient = twilioReady ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
 mongoose.connect(process.env.MONGO_URI).then(() => console.log("MongoDB Connected")).catch((err) => console.error("MongoDB Connection Error:", err.message));
 
@@ -69,7 +71,6 @@ app.post("/api/jobs/:id/apply", writeLimiter, async (req, res) => {
   } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-// Basic profile creation. SMS provider can be plugged into sendOtp() later.
 app.post("/api/users", writeLimiter, async (req, res) => {
   try {
     const { name, phone, city, role = "seeker" } = req.body;
@@ -79,34 +80,49 @@ app.post("/api/users", writeLimiter, async (req, res) => {
   } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-// OTP login flow. For now the OTP is logged by Render for testing; connect an SMS provider before public launch.
+function normalizePhone(phone) {
+  const value = String(phone || "").replace(/\s+/g, "").trim();
+  if (/^\+\d{10,15}$/.test(value)) return value;
+  if (/^91\d{10}$/.test(value)) return `+${value}`;
+  if (/^\d{10}$/.test(value)) return `+91${value}`;
+  return null;
+}
+
 app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
   try {
-    const phone = String(req.body.phone || "").trim();
+    const phone = normalizePhone(req.body.phone);
     const mode = req.body.mode === "login" ? "login" : "register";
-    if (!phone) return res.status(400).json({ success: false, error: "phone is required" });
+    if (!phone) return res.status(400).json({ success: false, error: "Enter a valid 10-digit mobile number" });
     if (mode === "login") {
-      const user = await User.findOne({ phone });
+      const rawPhone = phone.replace(/^\+91/, "");
+      const user = await User.findOne({ phone: { $in: [rawPhone, phone] } });
       if (!user) return res.status(404).json({ success: false, error: "Mobile number is not registered" });
     }
-    const otp = String(crypto.randomInt(100000, 1000000));
-    otpStore.set(phone, { otp, expiresAt: Date.now() + 5 * 60 * 1000, mode });
-    console.log(`[Umeed OTP] ${phone}: ${otp}`);
+    if (!twilioReady) return res.status(503).json({ success: false, error: "SMS OTP service is not configured yet" });
+    await twilioClient.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID).verifications.create({ to: phone, channel: "sms" });
     res.json({ success: true, message: "OTP sent successfully" });
-  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+  } catch (error) {
+    console.error("OTP send error:", error.message);
+    res.status(500).json({ success: false, error: "OTP could not be sent. Please try again." });
+  }
 });
 
 app.post("/api/auth/verify-otp", otpLimiter, async (req, res) => {
   try {
-    const phone = String(req.body.phone || "").trim();
+    const phone = normalizePhone(req.body.phone);
     const otp = String(req.body.otp || "").trim();
-    const record = otpStore.get(phone);
-    if (!record || record.expiresAt < Date.now() || record.otp !== otp) return res.status(400).json({ success: false, error: "Invalid or expired OTP" });
-    otpStore.delete(phone);
-    const user = await User.findOneAndUpdate({ phone }, { isVerified: true }, { new: true });
+    if (!phone || !/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, error: "Enter a valid 6-digit OTP" });
+    if (!twilioReady) return res.status(503).json({ success: false, error: "SMS OTP service is not configured yet" });
+    const check = await twilioClient.verify.v2.services(process.env.TWILIO_VERIFY_SERVICE_SID).verificationChecks.create({ to: phone, code: otp });
+    if (check.status !== "approved") return res.status(400).json({ success: false, error: "Invalid or expired OTP" });
+    const rawPhone = phone.replace(/^\+91/, "");
+    const user = await User.findOneAndUpdate({ phone: { $in: [rawPhone, phone] } }, { isVerified: true }, { new: true });
     if (!user) return res.status(404).json({ success: false, error: "User not found. Please register first." });
     res.json({ success: true, message: "Login successful", user });
-  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+  } catch (error) {
+    console.error("OTP verify error:", error.message);
+    res.status(400).json({ success: false, error: "Invalid or expired OTP" });
+  }
 });
 
 app.use((req, res) => res.status(404).json({ success: false, error: "Endpoint not found" }));
