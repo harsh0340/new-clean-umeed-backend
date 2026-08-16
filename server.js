@@ -1,6 +1,7 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const Job = require("./models/Job");
@@ -10,8 +11,22 @@ const User = require("./models/User");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
+app.set("trust proxy", 1);
+
+const allowedOrigins = (process.env.FRONTEND_URL || "").split(",").map((url) => url.trim()).filter(Boolean);
+app.use(cors({
+  origin: allowedOrigins.length ? allowedOrigins : true,
+  methods: ["GET", "POST", "PATCH", "OPTIONS"],
+}));
 app.use(express.json({ limit: "1mb" }));
+
+const writeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 100,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { success: false, error: "Too many requests. Please try again later." },
+});
 
 // Database
 mongoose
@@ -19,13 +34,17 @@ mongoose
   .then(() => console.log("MongoDB Connected"))
   .catch((err) => console.error("MongoDB Connection Error:", err.message));
 
-// Health check
+// Health checks
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "Umeed Backend", message: "API is running" });
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, service: "umeed-backend" });
+  res.json({
+    ok: mongoose.connection.readyState === 1,
+    service: "umeed-backend",
+    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+  });
 });
 
 // Get jobs with optional search, city and category filters.
@@ -67,8 +86,8 @@ app.get("/api/jobs/:id", async (req, res) => {
   }
 });
 
-// Post a job. Authentication/OTP protection will be added before public launch.
-app.post("/api/jobs", async (req, res) => {
+// Post a job. OTP/authentication will be required before unrestricted public launch.
+app.post("/api/jobs", writeLimiter, async (req, res) => {
   try {
     const { title, company, category, city } = req.body;
     if (!title || !company || !category || !city) {
@@ -86,7 +105,7 @@ app.post("/api/jobs", async (req, res) => {
 });
 
 // Apply for a job.
-app.post("/api/jobs/:id/apply", async (req, res) => {
+app.post("/api/jobs/:id/apply", writeLimiter, async (req, res) => {
   try {
     const { name, phone, city, experience, expectedSalary } = req.body;
     if (!name || !phone || !city) {
@@ -119,7 +138,7 @@ app.post("/api/jobs/:id/apply", async (req, res) => {
 });
 
 // Create/update a basic user profile. OTP verification will be wired to an SMS provider later.
-app.post("/api/users", async (req, res) => {
+app.post("/api/users", writeLimiter, async (req, res) => {
   try {
     const { name, phone, city, role = "seeker" } = req.body;
     if (!phone) return res.status(400).json({ success: false, error: "phone is required" });
@@ -134,6 +153,10 @@ app.post("/api/users", async (req, res) => {
   } catch (error) {
     res.status(400).json({ success: false, error: error.message });
   }
+});
+
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: "Endpoint not found" });
 });
 
 function escapeRegex(value) {
