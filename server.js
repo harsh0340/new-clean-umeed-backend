@@ -15,7 +15,13 @@ const PORT = process.env.PORT || 5000;
 app.set("trust proxy", 1);
 
 const allowedOrigins = (process.env.FRONTEND_URL || "").split(",").map((url) => url.trim()).filter(Boolean);
-app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : true, methods: ["GET", "POST", "PATCH", "OPTIONS"] }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin) || /^https:\/\/[a-z0-9-]+\.vercel\.app$/.test(origin)) return callback(null, true);
+    return callback(new Error("CORS origin not allowed"));
+  },
+  methods: ["GET", "POST", "PATCH", "OPTIONS"],
+}));
 app.use(express.json({ limit: "1mb" }));
 
 const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 100, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many requests. Please try again later." } });
@@ -96,6 +102,7 @@ function hashOtp(otp) {
 }
 
 app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
+  console.log("OTP request received for mobile login");
   try {
     const phone = normalizePhone(req.body.phone);
     if (!phone) return res.status(400).json({ success: false, error: "Enter a valid 10-digit mobile number" });
@@ -109,12 +116,12 @@ app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
     user.otpExpiresAt = new Date(Date.now() + 5 * 60 * 1000);
     await user.save();
 
-    await twilioClient.messages.create({
+    const message = await twilioClient.messages.create({
       body: `Your Umeed login OTP is ${otp}. It is valid for 5 minutes. Do not share this OTP with anyone.`,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: phone,
     });
-
+    console.log("Twilio SMS accepted:", message.sid);
     res.json({ success: true, message: "OTP sent successfully" });
   } catch (error) {
     console.error("OTP send error:", error.message);
