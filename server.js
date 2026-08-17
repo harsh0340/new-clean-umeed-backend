@@ -3,7 +3,6 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const crypto = require("crypto");
-const twilio = require("twilio");
 require("dotenv").config();
 
 const Job = require("./models/Job");
@@ -25,10 +24,6 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 100, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many requests. Please try again later." } });
-const otpLimiter = rateLimit({ windowMs: 10 * 60 * 1000, limit: 5, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many OTP requests. Please try again later." } });
-
-const twilioReady = Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_VERIFY_SERVICE_SID);
-const twilioClient = twilioReady ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
 mongoose.connect(process.env.MONGO_URI).then(() => console.log("MongoDB Connected")).catch((err) => console.error("MongoDB Connection Error:", err.message));
 
@@ -78,17 +73,6 @@ app.post("/api/jobs/:id/apply", writeLimiter, async (req, res) => {
   } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/users", writeLimiter, async (req, res) => {
-  try {
-    const { name, phone, city, role = "seeker" } = req.body;
-    if (!phone) return res.status(400).json({ success: false, error: "phone is required" });
-    const normalized = normalizePhone(phone);
-    if (!normalized) return res.status(400).json({ success: false, error: "Enter a valid 10-digit mobile number" });
-    const user = await User.findOneAndUpdate({ phone: { $in: [phone, normalized] } }, { name, phone: normalized, city, role }, { new: true, upsert: true, setDefaultsOnInsert: true, runValidators: true });
-    res.status(200).json({ success: true, user });
-  } catch (error) { res.status(400).json({ success: false, error: error.message }); }
-});
-
 function normalizePhone(phone) {
   const value = String(phone || "").replace(/\s+/g, "").trim();
   if (/^\+\d{10,15}$/.test(value)) return value;
@@ -97,51 +81,54 @@ function normalizePhone(phone) {
   return null;
 }
 
-app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
-  console.log("OTP request received for mobile login");
+function normalizeEmail(email) {
+  const value = String(email || "").trim().toLowerCase();
+  return value && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? value : null;
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, key] = String(stored || "").split(":");
+  if (!salt || !key) return false;
+  const derived = crypto.scryptSync(password, salt, 64);
+  const storedKey = Buffer.from(key, "hex");
+  return storedKey.length === derived.length && crypto.timingSafeEqual(storedKey, derived);
+}
+
+app.post("/api/users", writeLimiter, async (req, res) => {
   try {
-    const phone = normalizePhone(req.body.phone);
-    if (!phone) return res.status(400).json({ success: false, error: "Enter a valid 10-digit mobile number" });
-    if (!twilioReady) return res.status(503).json({ success: false, error: "SMS OTP service is not configured yet" });
+    const { name, phone, email, password, city, role = "seeker" } = req.body;
+    const normalizedPhone = phone ? normalizePhone(phone) : null;
+    const normalizedEmail = email ? normalizeEmail(email) : null;
+    if (!normalizedPhone && !normalizedEmail) return res.status(400).json({ success: false, error: "Mobile number ya valid Email ID mein se koi ek zaroori hai" });
+    if (!name || !city) return res.status(400).json({ success: false, error: "Name and city are required" });
+    if (!password || String(password).length < 6) return res.status(400).json({ success: false, error: "Password must be at least 6 characters" });
 
-    const user = await User.findOne({ phone: { $in: [phone, phone.replace(/^\+91/, "")] } });
-    if (!user) return res.status(404).json({ success: false, error: "Mobile number is not registered" });
+    const existing = await User.findOne({ $or: [normalizedPhone ? { phone: normalizedPhone } : null, normalizedEmail ? { email: normalizedEmail } : null].filter(Boolean) });
+    if (existing) return res.status(409).json({ success: false, error: "Mobile number or Email ID is already registered" });
 
-    const verification = await twilioClient.verify.v2
-      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-      .verifications.create({ channel: "sms", to: phone });
-
-    console.log("Twilio Verify accepted:", verification.sid, verification.status);
-    res.json({ success: true, message: "OTP sent successfully" });
-  } catch (error) {
-    console.error("OTP send error:", error.message);
-    res.status(500).json({ success: false, error: "OTP could not be sent. Please try again." });
-  }
+    const user = await User.create({ name: name.trim(), phone: normalizedPhone || undefined, email: normalizedEmail || undefined, passwordHash: hashPassword(String(password)), city: city.trim(), role, isVerified: false });
+    res.status(201).json({ success: true, message: "Registration successful! Umeed account create ho gaya.", user: { id: user._id, name: user.name, phone: user.phone, email: user.email, city: user.city, role: user.role } });
+  } catch (error) { res.status(400).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/auth/verify-otp", otpLimiter, async (req, res) => {
+app.post("/api/auth/login", writeLimiter, async (req, res) => {
   try {
-    const phone = normalizePhone(req.body.phone);
-    const otp = String(req.body.otp || "").trim();
-    if (!phone || !/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, error: "Enter a valid 6-digit OTP" });
-    if (!twilioReady) return res.status(503).json({ success: false, error: "SMS OTP service is not configured yet" });
-
-    const user = await User.findOne({ phone: { $in: [phone, phone.replace(/^\+91/, "")] } }).select("name phone city role isVerified");
-    if (!user) return res.status(404).json({ success: false, error: "User not found. Please register first." });
-
-    const verificationCheck = await twilioClient.verify.v2
-      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
-      .verificationChecks.create({ code: otp, to: phone });
-
-    if (verificationCheck.status !== "approved") return res.status(400).json({ success: false, error: "Invalid OTP" });
-
-    user.isVerified = true;
-    await user.save();
-    res.json({ success: true, message: "Login successful", user });
-  } catch (error) {
-    console.error("OTP verify error:", error.message);
-    res.status(400).json({ success: false, error: "Invalid or expired OTP" });
-  }
+    const { identifier, password } = req.body;
+    if (!identifier || !password) return res.status(400).json({ success: false, error: "Mobile/Email and password are required" });
+    const normalizedPhone = normalizePhone(identifier);
+    const normalizedEmail = normalizeEmail(identifier);
+    const query = normalizedPhone ? { phone: normalizedPhone } : normalizedEmail ? { email: normalizedEmail } : null;
+    if (!query) return res.status(400).json({ success: false, error: "Enter a valid mobile number or Email ID" });
+    const user = await User.findOne(query).select("+passwordHash name phone email city role isVerified");
+    if (!user || !verifyPassword(String(password), user.passwordHash)) return res.status(401).json({ success: false, error: "Invalid mobile/email or password" });
+    res.json({ success: true, message: "Login successful!", user: { id: user._id, name: user.name, phone: user.phone, email: user.email, city: user.city, role: user.role } });
+  } catch (error) { res.status(500).json({ success: false, error: "Login failed. Please try again." }); }
 });
 
 app.use((req, res) => res.status(404).json({ success: false, error: "Endpoint not found" }));
