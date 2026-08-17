@@ -27,7 +27,7 @@ app.use(express.json({ limit: "1mb" }));
 const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 100, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many requests. Please try again later." } });
 const otpLimiter = rateLimit({ windowMs: 10 * 60 * 1000, limit: 5, standardHeaders: "draft-7", legacyHeaders: false, message: { success: false, error: "Too many OTP requests. Please try again later." } });
 
-const twilioReady = Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_PHONE_NUMBER);
+const twilioReady = Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_VERIFY_SERVICE_SID);
 const twilioClient = twilioReady ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
 mongoose.connect(process.env.MONGO_URI).then(() => console.log("MongoDB Connected")).catch((err) => console.error("MongoDB Connection Error:", err.message));
@@ -97,10 +97,6 @@ function normalizePhone(phone) {
   return null;
 }
 
-function hashOtp(otp) {
-  return crypto.createHash("sha256").update(String(otp)).digest("hex");
-}
-
 app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
   console.log("OTP request received for mobile login");
   try {
@@ -111,17 +107,11 @@ app.post("/api/auth/send-otp", otpLimiter, async (req, res) => {
     const user = await User.findOne({ phone: { $in: [phone, phone.replace(/^\+91/, "")] } });
     if (!user) return res.status(404).json({ success: false, error: "Mobile number is not registered" });
 
-    const otp = String(crypto.randomInt(100000, 1000000));
-    user.otpHash = hashOtp(otp);
-    user.otpExpiresAt = new Date(Date.now() + 5 * 60 * 1000);
-    await user.save();
+    const verification = await twilioClient.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({ channel: "sms", to: phone });
 
-    const message = await twilioClient.messages.create({
-      body: `Your Umeed login OTP is ${otp}. It is valid for 5 minutes. Do not share this OTP with anyone.`,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: phone,
-    });
-    console.log("Twilio SMS accepted:", message.sid);
+    console.log("Twilio Verify accepted:", verification.sid, verification.status);
     res.json({ success: true, message: "OTP sent successfully" });
   } catch (error) {
     console.error("OTP send error:", error.message);
@@ -134,15 +124,18 @@ app.post("/api/auth/verify-otp", otpLimiter, async (req, res) => {
     const phone = normalizePhone(req.body.phone);
     const otp = String(req.body.otp || "").trim();
     if (!phone || !/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, error: "Enter a valid 6-digit OTP" });
+    if (!twilioReady) return res.status(503).json({ success: false, error: "SMS OTP service is not configured yet" });
 
-    const user = await User.findOne({ phone: { $in: [phone, phone.replace(/^\+91/, "")] } }).select("+otpHash +otpExpiresAt name phone city role isVerified");
+    const user = await User.findOne({ phone: { $in: [phone, phone.replace(/^\+91/, "")] } }).select("name phone city role isVerified");
     if (!user) return res.status(404).json({ success: false, error: "User not found. Please register first." });
-    if (!user.otpHash || !user.otpExpiresAt || user.otpExpiresAt.getTime() < Date.now()) return res.status(400).json({ success: false, error: "OTP expired. Please request a new OTP." });
-    if (hashOtp(otp) !== user.otpHash) return res.status(400).json({ success: false, error: "Invalid OTP" });
+
+    const verificationCheck = await twilioClient.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({ code: otp, to: phone });
+
+    if (verificationCheck.status !== "approved") return res.status(400).json({ success: false, error: "Invalid OTP" });
 
     user.isVerified = true;
-    user.otpHash = null;
-    user.otpExpiresAt = null;
     await user.save();
     res.json({ success: true, message: "Login successful", user });
   } catch (error) {
