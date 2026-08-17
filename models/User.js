@@ -7,6 +7,8 @@ const userSchema = new mongoose.Schema(
     city: { type: String, trim: true, maxlength: 100 },
     role: { type: String, enum: ["seeker", "employer", "admin"], default: "seeker" },
     isVerified: { type: Boolean, default: false },
+    otpHash: { type: String, default: null, select: false },
+    otpExpiresAt: { type: Date, default: null, select: false },
   },
   { timestamps: true }
 );
